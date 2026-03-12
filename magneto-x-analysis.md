@@ -137,58 +137,140 @@ on the MCU for better noise rejection and tap detection.
 
 ---
 
-## What's Left To Do
+## Deep Dive: "Stepper too far in past" & Move Queue Overflow
 
-### HIGH PRIORITY
+### The Error Mechanism
 
-1. **Investigate "Stepper too far in past" root cause**
-   - Is the linear motor driver adding latency to step pulses?
-   - Can this be fixed by adjusting step timing parameters rather than disabling the safety check?
-   - Check if upstream's move lookahead or step compression helps
+The error lives in `stepper_load_next()` (`src/stepper.c:104-108`), which runs when
+the MCU finishes one move segment and loads the next from its queue:
 
-2. **Move queue overflow at high speeds**
-   - At 1500mm/s with high acceleration, the step rate may overwhelm the STM32H723
-   - Investigate step compression, step-on-both-edges, and queue size tuning
-   - May need to profile the MCU load during high-speed linear motor moves
+```c
+// stepper_load_next() - called when current move finishes
+uint32_t min_next_time = s->time.waketime;  // time of last step event
+s->next_step_time += move_interval;          // scheduled time of first step in new move
 
-3. **Load cell false trigger investigation**
-   - Why does the load cell report "triggered" before probing begins?
-   - Is this a timing issue with the STC8051 clear/tare sequence?
-   - Could upstream's analog load cell approach (HX711 + SOS filter) replace the digital trigger entirely?
+if (was_active && timer_is_before(s->next_step_time, min_next_time)) {
+    int32_t diff = s->next_step_time - min_next_time;
+    if (diff < (int32_t)-timer_from_us(1000))   // more than 1ms behind?
+        shutdown("Stepper too far in past");     // SHUTDOWN
+    s->time.waketime = min_next_time;            // else: clamp to now
+}
+```
 
-### MEDIUM PRIORITY
+This fires when:
+1. The stepper is actively stepping (finishing one move, loading the next)
+2. The first step of the **new** move was supposed to happen >1ms **before** the
+   last step of the previous move finished
+3. This means the MCU fell behind — it couldn't execute steps fast enough
 
-4. **Evaluate replacing CS1237/STC8051 with HX711/HX717**
-   - Would give Klipper direct access to analog force data
-   - Enables upstream's sophisticated tap detection algorithm
-   - Eliminates the STC8051 as a failure point
-   - Hardware modification required — is it worth it?
+### Why STM32H7 is Affected
 
-5. **Create proper Magneto X board/printer config for upstream Klipper**
-   - Map all pin assignments from Peopoly's config
-   - Use upstream's probe infrastructure instead of workarounds
-   - Test with latest Klipper (not stuck on V0.11)
+**Critical finding**: STM32H7 does NOT get the edge-optimized stepper path:
 
-### LOW PRIORITY
+```
+src/stm32/Kconfig:16:  select HAVE_STEPPER_OPTIMIZED_BOTH_EDGE if !MACH_STM32H7
+```
 
-6. **Horizontal_move_z per-command override**
-   - Peopoly's probe.py patch to allow GCode override of `horizontal_move_z` is
-     actually useful — could be submitted as an upstream PR
+So STM32H723 uses `stepper_event_full()`, which:
+- Fires **twice per step** (once for step, once for unstep)
+- Reads `timer_read_time()` on every event
+- Has more overhead per step than the edge-optimized path
 
-7. **ESP32 linear motor driver documentation**
-   - Document the initialization/calibration sequence
-   - Document error codes and recovery procedures
-   - Understand what happens when the ESP32 loses step sync
+The edge-optimized path (`stepper_event_edge()`) toggles GPIO on each call, meaning
+it fires only **once per step** and avoids the timing check entirely. This path
+is available on other STM32 families but NOT H7.
+
+### Step Rate Math for Magneto X
+
+Config: `rotation_distance=3.2mm, microsteps=16`
+
+```
+Steps per mm = (200 full steps × 16 microsteps) / 3.2mm = 1000 steps/mm
+
+At 1500 mm/s:  1,500,000 steps/sec = 1.5 MHz step rate
+At 500 mm/s:     500,000 steps/sec = 500 kHz step rate
+At 100 mm/s:     100,000 steps/sec = 100 kHz step rate
+```
+
+With `stepper_event_full()` firing twice per step:
+
+```
+At 1500 mm/s: 3,000,000 timer events/sec → 173 MCU ticks between events (520MHz)
+At 500 mm/s:  1,000,000 timer events/sec → 520 MCU ticks between events
+```
+
+**173 ticks between events at max speed is extremely tight**. Each `stepper_event_full()`
+call includes a `timer_read_time()`, GPIO toggle, comparison, and conditional branch.
+This easily exceeds the available time budget, causing the MCU to fall behind.
+
+### Move Queue Overflow Connection
+
+The "Move queue overflow" (`src/basecmd.c:90`) fires when `move_alloc()` finds the
+free list empty. The move pool is allocated at startup (`alloc_chunks(move_item_size, 1024, &move_count)`), requesting up to 1024 entries.
+
+The connection to "stepper too far in past":
+1. At high step rates, each move segment covers fewer steps (step compression
+   creates segments of similar time duration)
+2. More segments are consumed per second → moves are dequeued faster
+3. If the host can't refill the queue fast enough → overflow
+4. Meanwhile, the MCU is also falling behind on step execution → "too far in past"
+
+Both errors share the root cause: **the step rate is too high for the MCU to handle**.
+
+### Why The Linear Motor Makes It Worse
+
+The linear motor itself isn't the direct cause — the step rate is. But:
+
+1. **rotation_distance=3.2mm is very small** — typical belt-driven printers use
+   32-40mm rotation distance, giving 10-12x fewer steps/mm
+2. **1500mm/s is extremely fast** — combined with the small rotation_distance,
+   this creates an enormous step rate
+3. **No step-on-both-edges optimization** on STM32H7 means double the timer events
+4. **The ESP32 driver may have minimum pulse width requirements** that increase
+   `step_pulse_ticks`, further constraining timing
+
+### Possible Solutions
+
+**Option A: Reduce effective step rate (config-level)**
+- Increase `rotation_distance` if the linear motor encoder allows coarser stepping
+- Reduce `microsteps` from 16 to 8 or 4 (halves/quarters the step rate)
+- Lower `max_velocity` to stay within MCU capacity
+
+**Option B: Enable edge optimization for STM32H7 (firmware-level)**
+- The edge optimization is disabled on H7 — investigate why
+- If the H7 GPIO toggle timing meets the `EDGE_STEP_TICKS` requirement,
+  enabling it would halve the timer event rate
+- This is the most impactful single change
+
+**Option C: Increase the safety threshold (firmware-level)**
+- Peopoly's approach (commenting out the check entirely) is dangerous
+- A better fix: increase the threshold from 1ms to something larger (e.g., 5ms)
+- This tolerates temporary MCU overload without hiding catastrophic failures
+
+**Option D: Use step compression more aggressively (host-level)**
+- Adjust `STEPCOMPRESS_FLUSH_TIME` and compression parameters
+- Larger move segments = fewer queue entries consumed per second
+- Reduces both "too far in past" and "move queue overflow" likelihood
 
 ---
 
-## Summary Table
+## Updated Status
 
 | Area | Status | Key Finding |
 |---|---|---|
 | Linear motor ↔ Klipper | **SOLVED** | Standard step/dir pulses, no custom protocol |
 | Load cell protocol | **SOLVED** | Digital trigger via STC8051, not analog |
-| Stepper timing issue | **IDENTIFIED** | Safety check disabled — needs real fix |
-| Move queue overflow | **IDENTIFIED** | High step rates at 1500mm/s overwhelm MCU |
+| Stepper timing | **ROOT CAUSE FOUND** | 1.5M steps/sec at max speed + no H7 edge optimization + stepper_event_full() 2x overhead = MCU can't keep up |
+| Move queue overflow | **ROOT CAUSE FOUND** | Same cause — high step consumption rate exhausts move pool |
 | Load cell false triggers | **IDENTIFIED** | Tare/clear sequence unreliable |
 | Upstream compatibility | **GAP** | Fork stuck on V0.11, needs port to current |
+
+## Recommended Next Steps
+
+1. **Investigate why edge optimization is disabled on STM32H7** — enabling it
+   would be the single biggest improvement (halves timer event rate)
+2. **Test with reduced microsteps** (8 or 4) to confirm step rate is the issue
+3. **Check ESP32 minimum pulse width** — if it needs long pulses, `step_pulse_ticks`
+   may be the bottleneck
+4. **Evaluate load cell upgrade** — replace CS1237/STC8051 with HX717 for upstream
+   `load_cell_probe` compatibility
