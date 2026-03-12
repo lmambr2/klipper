@@ -229,28 +229,92 @@ The linear motor itself isn't the direct cause — the step rate is. But:
 4. **The ESP32 driver may have minimum pulse width requirements** that increase
    `step_pulse_ticks`, further constraining timing
 
-### Possible Solutions
+### Why H7 Is Excluded from Edge Optimization
 
-**Option A: Reduce effective step rate (config-level)**
-- Increase `rotation_distance` if the linear motor encoder allows coarser stepping
-- Reduce `microsteps` from 16 to 8 or 4 (halves/quarters the step rate)
-- Lower `max_velocity` to stay within MCU capacity
+Investigated via upstream PRs [#6852](https://github.com/Klipper3d/klipper/pull/6852)
+and [#6853](https://github.com/Klipper3d/klipper/pull/6853).
 
-**Option B: Enable edge optimization for STM32H7 (firmware-level)**
-- The edge optimization is disabled on H7 — investigate why
-- If the H7 GPIO toggle timing meets the `EDGE_STEP_TICKS` requirement,
-  enabling it would halve the timer event rate
-- This is the most impactful single change
+**The H7's GPIO registers are absurdly slow to read** — 15+ CPU cycles for
+`regs->ODR ^= g.bit`. Kevin O'Connor added a cached BSRR approach
+(`stm32h7_gpio.c`) that caches the ODR register in RAM. This made the GPIO
+toggle so fast that the `stepper_event_edge()` path would **violate the minimum
+pulse width requirement** for Trinamic drivers (the step pin would toggle faster
+than the driver can register).
 
-**Option C: Increase the safety threshold (firmware-level)**
-- Peopoly's approach (commenting out the check entirely) is dangerous
-- A better fix: increase the threshold from 1ms to something larger (e.g., 5ms)
-- This tolerates temporary MCU overload without hiding catastrophic failures
+So the edge optimization (`stepper_event_edge()`) was disabled for H7 to prevent
+Trinamic pulse width violations. Instead, H7 uses `stepper_event_full()` which
+has explicit `step_pulse_ticks` timing.
 
-**Option D: Use step compression more aggressively (host-level)**
-- Adjust `STEPCOMPRESS_FLUSH_TIME` and compression parameters
-- Larger move segments = fewer queue entries consumed per second
-- Reduces both "too far in past" and "move queue overflow" likelihood
+**However**, PR #6852 added "step on both edges" support to `stepper_event_full()`
+itself — when `invert_step=-1` (i.e., `SF_SINGLE_SCHED`), the full path fires
+**once per step** instead of twice (step + unstep). This is the modern path for
+both-edge stepping on H7, and it respects `step_pulse_ticks`.
+
+**STM32H723 benchmark results**: 7,429K steps/sec (1 stepper), 8,619K steps/sec
+(3 steppers) — the **fastest MCU in Klipper's benchmarks**. Raw throughput is not
+the issue.
+
+### The Real Problem: Default Pulse Duration + No TMC Driver
+
+The Magneto X linear motor axes (X/Y) go to an ESP32 driver board, not a TMC
+driver. This means:
+
+1. **No TMC module** → `setup_default_pulse_duration()` is never called
+2. **Default `step_pulse_duration` = 2µs** (`stepper.py:81`)
+3. 2µs > 500ns (`MIN_BOTH_EDGE_DURATION`) → **step-on-both-edges is DISABLED**
+4. `step_pulse_ticks` = 520MHz × 2µs = **1040 ticks** (minimum time between edges)
+5. The stepper uses **double-scheduled mode** (step + unstep = 2 events per step)
+
+At 1500mm/s with 1000 steps/mm:
+- 1.5M steps/sec × 2 events = **3M timer events/sec**
+- At 520MHz, 3M events/sec = **173 ticks between events**
+- But `step_pulse_ticks = 1040` requires minimum 1040 ticks between step and unstep
+- This means the **actual minimum interval per step is 2080 ticks** (step + unstep)
+- Maximum achievable step rate = 520M / 2080 = **250K steps/sec = 250mm/s**
+
+**This is the smoking gun: with default 2µs pulse duration, the Magneto X maxes
+out at ~250mm/s per axis — not the configured 1500mm/s.**
+
+### The Fix
+
+The solution is simple — configure the correct `step_pulse_duration` for the
+ESP32 linear motor driver:
+
+**Option A: Set `step_pulse_duration` in printer.cfg (RECOMMENDED)**
+```ini
+[stepper_x]
+step_pulse_duration: 0.000000100  # 100ns — same as TMC drivers
+```
+If the ESP32 driver can handle 100ns pulses (likely, since it's just edge detection),
+this enables step-on-both-edges mode automatically:
+- `100ns < 500ns` → both-edges enabled → `SF_SINGLE_SCHED` → 1 event per step
+- `step_pulse_ticks` = 520MHz × 100ns = 52 ticks
+- Max step rate ≈ 520M / 52 = **10M steps/sec** — more than enough for 1500mm/s
+
+**Option B: If ESP32 needs longer pulses**
+If the ESP32 requires >500ns pulse width, set it explicitly:
+```ini
+[stepper_x]
+step_pulse_duration: 0.000001  # 1µs
+```
+This still gives `step_pulse_ticks = 520`, and even in double-event mode:
+- Max step rate = 520M / (520×2) = **500K steps/sec = 500mm/s**
+- Enough for many operations but NOT for 1500mm/s
+
+**Option C: If ESP32 driver supports dedge mode directly**
+Some drivers interpret both rising AND falling edges as step events. If the ESP32
+driver does this, set both `step_pulse_duration: 0.000000100` in config.
+
+### Why Peopoly's "Fix" Was Wrong
+
+Peopoly commented out the "Stepper too far in past" check because the MCU was
+falling behind. But the root cause was using a 2µs default pulse duration with
+a non-TMC driver — creating an artificially low step rate ceiling of ~250mm/s.
+When the printer tried to move at 1500mm/s, the MCU couldn't generate steps fast
+enough, fell behind by >1ms, and triggered the shutdown.
+
+The proper fix is to configure the correct pulse duration, not to disable the
+safety check.
 
 ---
 
@@ -260,17 +324,18 @@ The linear motor itself isn't the direct cause — the step rate is. But:
 |---|---|---|
 | Linear motor ↔ Klipper | **SOLVED** | Standard step/dir pulses, no custom protocol |
 | Load cell protocol | **SOLVED** | Digital trigger via STC8051, not analog |
-| Stepper timing | **ROOT CAUSE FOUND** | 1.5M steps/sec at max speed + no H7 edge optimization + stepper_event_full() 2x overhead = MCU can't keep up |
-| Move queue overflow | **ROOT CAUSE FOUND** | Same cause — high step consumption rate exhausts move pool |
+| Stepper timing | **ROOT CAUSE + FIX** | Default 2µs pulse duration limits step rate to ~250mm/s. Fix: set `step_pulse_duration: 0.000000100` in config |
+| Move queue overflow | **ROOT CAUSE + FIX** | Same cause — fix pulse duration, step rate ceiling goes from 250K to 10M steps/sec |
+| H7 edge optimization | **SOLVED** | Disabled for good reason (Trinamic pulse width), but `stepper_event_full()` supports both-edges via `SF_SINGLE_SCHED` |
 | Load cell false triggers | **IDENTIFIED** | Tare/clear sequence unreliable |
 | Upstream compatibility | **GAP** | Fork stuck on V0.11, needs port to current |
 
 ## Recommended Next Steps
 
-1. **Investigate why edge optimization is disabled on STM32H7** — enabling it
-   would be the single biggest improvement (halves timer event rate)
-2. **Test with reduced microsteps** (8 or 4) to confirm step rate is the issue
-3. **Check ESP32 minimum pulse width** — if it needs long pulses, `step_pulse_ticks`
-   may be the bottleneck
+1. **Determine ESP32 linear motor driver minimum pulse width** — test with 100ns,
+   500ns, and 1µs to find the minimum that works reliably
+2. **Set correct `step_pulse_duration` in Magneto X config** for X/Y steppers
+3. **Re-enable the "Stepper too far in past" safety check** — it should no longer
+   trigger with correct pulse configuration
 4. **Evaluate load cell upgrade** — replace CS1237/STC8051 with HX717 for upstream
    `load_cell_probe` compatibility
