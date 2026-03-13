@@ -330,12 +330,273 @@ safety check.
 | Load cell false triggers | **IDENTIFIED** | Tare/clear sequence unreliable |
 | Upstream compatibility | **GAP** | Fork stuck on V0.11, needs port to current |
 
-## Recommended Next Steps
+---
 
-1. **Determine ESP32 linear motor driver minimum pulse width** — test with 100ns,
-   500ns, and 1µs to find the minimum that works reliably
-2. **Set correct `step_pulse_duration` in Magneto X config** for X/Y steppers
-3. **Re-enable the "Stepper too far in past" safety check** — it should no longer
-   trigger with correct pulse configuration
-4. **Evaluate load cell upgrade** — replace CS1237/STC8051 with HX717 for upstream
-   `load_cell_probe` compatibility
+## ESP32 Linear Motor Driver — Pulse Width Analysis
+
+### The Problem
+
+Our initial recommendation of "just set 100ns like TMC drivers" was premature.
+The ESP32-based linear motor driver is **not a TMC chip** — its minimum pulse
+width depends entirely on how its firmware detects step pulses.
+
+### ESP32 GPIO Input Timing
+
+The ESP32 datasheet does **not formally specify** a minimum GPIO input pulse width.
+The achievable minimum depends on the firmware's detection method:
+
+| Detection Method | Min Pulse Width | Max Step Rate | Notes |
+|---|---|---|---|
+| **GPIO interrupt (ISR)** | ~2-5µs | ~200-500K/s | Typical ISR latency; WiFi can spike to 50µs+ |
+| **Polling loop (dedicated core)** | ~120ns | ~3.6M/s | Pins task to one core, disables interrupts |
+| **PCNT hardware peripheral** | ~12.5ns | ~40M/s | Hardware counter, no CPU involvement |
+| **RMT hardware peripheral** | ~12.5ns | ~40M/s | Hardware, 80MHz APB clock resolution |
+
+**Key risk**: If the ESP32 firmware uses standard GPIO interrupts (the most common
+approach), then pulses shorter than ~2µs will be **missed**. Setting 100ns would
+cause silent step loss and positional errors — potentially worse than the current
+timing shutdown.
+
+### ESP32 vs TMC Driver Comparison
+
+| Driver | Min Pulse Width | Step Both Edges | Source |
+|---|---|---|---|
+| TMC2209 | 100ns | Yes | Datasheet spec |
+| TMC5160 | 100ns | Yes | Datasheet spec |
+| A4988 | 1µs | No | Datasheet spec |
+| DRV8825 | 1.9µs | No | Datasheet spec |
+| ESP32 (ISR) | ~2-5µs | Unknown | Architecture limit |
+| ESP32 (PCNT) | ~12.5ns | N/A | Hardware peripheral |
+
+### What We Don't Know
+
+The Peopoly ESP32 firmware is proprietary. We cannot determine from external
+analysis whether it uses:
+- GPIO interrupts (would need ≥2µs pulses)
+- A dedicated polling loop (could handle ~120ns)
+- PCNT/RMT hardware peripheral (could handle ~12.5ns)
+
+The LinearMotorHost configuration tool mentions "Pulse Input Resolution" (distance
+per pulse) but does **not document minimum pulse width timing**.
+
+### Additional ESP32 Concerns
+
+- **No Schmitt triggers** on ESP32 GPIO inputs — slow rise/fall times can cause
+  spurious edge detection and double-triggering
+- **Flash cache misses** during ISR execution can delay interrupt handling by
+  tens of microseconds
+- **RTOS task scheduling** introduces non-deterministic latency
+
+### Revised Recommendations
+
+Given the uncertainty, a **tiered approach** is recommended:
+
+**Tier 1 — Safe (works regardless of ESP32 firmware)**
+```ini
+[stepper_x]
+step_pulse_duration: 0.000005  # 5µs — safe for any detection method
+```
+- `step_pulse_ticks` = 520MHz × 5µs = 2600 ticks
+- Double-event mode: max step rate = 520M / (2600×2) = **100K steps/sec = 100mm/s**
+- **Too slow** for Magneto X at full speed, but guaranteed to work
+- Useful for initial testing and validation
+
+**Tier 2 — Moderate (likely works, needs testing)**
+```ini
+[stepper_x]
+step_pulse_duration: 0.000002  # 2µs — current Klipper default
+```
+- This is the existing default behavior, unchanged
+- Max step rate = 250K steps/sec = **250mm/s**
+- Sufficient for probing, homing, moderate print speeds
+
+**Tier 3 — Aggressive (requires validation)**
+```ini
+[stepper_x]
+step_pulse_duration: 0.000001  # 1µs
+```
+- `step_pulse_ticks` = 520 ticks, double-event mode
+- Max step rate = 520M / (520×2) = **500K steps/sec = 500mm/s**
+- Good for most printing, may miss steps if ESP32 uses slow ISR path
+
+**Tier 4 — Optimal (requires ESP32 firmware confirmation)**
+```ini
+[stepper_x]
+step_pulse_duration: 0.000000100  # 100ns — enables both-edges
+```
+- `100ns < 500ns` → enables `SF_SINGLE_SCHED` (1 event per step)
+- Max step rate ≈ **10M steps/sec** → **10,000mm/s** theoretical
+- **Only safe if ESP32 uses PCNT/RMT or dedicated polling**
+- If ESP32 uses GPIO ISR, this will cause silent step loss
+
+### Testing Protocol
+
+To determine the ESP32's actual minimum pulse width:
+
+1. **Start at Tier 1** (5µs) — verify basic motion works
+2. **Move to Tier 2** (2µs) — should match current behavior
+3. **Try Tier 3** (1µs) — test at 400mm/s, check for position errors
+4. **Try Tier 4** (100ns) — test at 800mm/s+, verify with endstop accuracy
+5. At each tier, run a multi-axis move pattern and check:
+   - No "Stepper too far in past" shutdown
+   - No "Move queue overflow" errors
+   - Endstop positions are repeatable (±0.01mm)
+   - No layer shifts or missed steps in prints
+
+### Most Likely Scenario
+
+Given that Peopoly designed this system for 1500mm/s operation, the ESP32
+firmware **almost certainly uses PCNT or a dedicated polling loop** — GPIO
+interrupts would be inadequate at those speeds. This means Tier 4 (100ns)
+is likely safe, but should be validated empirically.
+
+A strong clue: the LinearMotorHost allows setting "Pulse Input Resolution" to
+20,000 pulses per mm. At 1500mm/s, that's 30M pulses/sec — only achievable
+with hardware peripheral detection (PCNT/RMT).
+
+---
+
+## Load Cell Upgrade Path: CS1237/STC8051 → HX717
+
+### Current System (Peopoly)
+
+```
+Strain Gauge → CS1237 ADC → STC8051 MCU → Digital HIGH/LOW → RP2040 GPIO24
+                              ↑ DIP switches
+                              (threshold=200)
+```
+
+**Problems**:
+- Crude threshold-based triggering with no software control
+- DIP switches for sensitivity adjustment (requires physical access)
+- No tare/drift compensation in firmware
+- False triggers cause "Probe triggered prior to movement" errors
+- No force data available to Klipper — just a binary on/off
+
+### Proposed System (Upstream Klipper)
+
+```
+Strain Gauge → HX717 ADC → RP2040 (DOUT + SCLK GPIOs) → Klipper load_cell_probe
+                                                           ↑ SOS filter
+                                                           ↑ Software tare
+                                                           ↑ Force threshold (grams)
+```
+
+### Upstream Klipper Load Cell Support
+
+Supported ADC sensors (`klippy/extras/load_cell.py`):
+- **HX711** — 24-bit, 10/80 SPS, gains: A-128, B-32, A-64
+- **HX717** — 24-bit, 10/20/80/320 SPS, gains: A-128, B-64, A-64, B-8
+- **ADS1220** — 24-bit SPI, 20-2000 SPS, gains 1-128
+
+**No CS1237 driver exists** in upstream Klipper. Only `sensor_hx71x.c` in `src/`.
+
+### HX717 vs CS1237
+
+| Feature | CS1237 (current) | HX717 (upgrade) |
+|---|---|---|
+| Resolution | 24-bit, ENOB ~20 bits | 24-bit, noise-free ~18.2 bits |
+| Max sample rate | 1280 Hz | 320 SPS |
+| Interface | SPI-like (SCLK + DRDY/DOUT) | Bit-banged GPIO (DOUT + SCLK) |
+| Klipper driver | None | Full support (`hx71x.py` + `sensor_hx71x.c`) |
+| Noise rejection | STC8051 threshold only | SOS filter + continuous tare |
+| Configuration | DIP switches | Software (`printer.cfg`) |
+
+The CS1237 has higher raw specs, but that's irrelevant — the STC8051 discards
+all that data through crude thresholding. HX717 at 320 SPS with Klipper's SOS
+filter is a massive improvement.
+
+### Hardware Changes Required
+
+1. **Remove/bypass STC8051** from the signal chain (it currently consumes all
+   ADC data and outputs only binary HIGH/LOW)
+2. **Replace CS1237 with HX717** breakout board (~$2-5)
+3. **Reuse the existing strain gauge** — the gauge itself is standard
+4. **Wire HX717 to two RP2040 GPIOs**:
+   - DOUT (data + ready signal) → e.g. GPIO24
+   - SCLK (serial clock) → e.g. GPIO25
+5. Both pins must be on the **same MCU** (enforced by `hx71x.py`)
+6. Power HX717 from toolhead PCB supply (2.7-5.5V)
+
+### Firmware Changes Required
+
+- Flash RP2040 toolhead with **upstream Klipper firmware** (includes `sensor_hx71x.c`)
+- Peopoly's custom V0.11 firmware does NOT include `load_cell_probe` support
+
+### Configuration
+
+```ini
+[load_cell_probe]
+sensor_type: hx717
+dout_pin: MAG_TOOL:gpio24
+sclk_pin: MAG_TOOL:gpio25
+sample_rate: 320
+gain: A-128
+counts_per_gram: <calibrated>         # Run LOAD_CELL_CALIBRATE
+reference_tare_counts: <calibrated>   # Run LOAD_CELL_TARE
+trigger_force: 75                     # grams — tunable in software
+```
+
+### Software Dependencies
+
+- **NumPy** — required by `load_cell_probe.py`
+- **SciPy** — required by `trigger_analog.py` for SOS filter design
+
+### Benefits
+
+- **Eliminates false triggers** — SOS filter rejects noise, continuous tare
+  handles drift
+- **Software-controlled sensitivity** — `trigger_force` in grams, adjustable
+  without physical access
+- **Diagnostic tools** — `LOAD_CELL_DIAGNOSTIC`, `LOAD_CELL_TEST_TAP`
+- **Safety limits** — prevents bed crashes with force monitoring
+- **Real-time force data** — available via webhooks for monitoring
+- **Removes magneto_load_cell.py workaround** — no more LC28/LL28/LH28 commands
+- **Removes homing.py workaround** — proper tare eliminates "probe triggered
+  prior to movement"
+
+### Risks
+
+- Requires **physical modification** of toolhead PCB
+- Need to identify available GPIOs on RP2040 (may require PCB tracing)
+- Peopoly's custom firmware conflicts with upstream
+- Warranty implications
+
+---
+
+## Complete Status
+
+| Area | Status | Key Finding |
+|---|---|---|
+| Linear motor ↔ Klipper | **SOLVED** | Standard step/dir pulses, no custom protocol |
+| Load cell protocol | **SOLVED** | Digital trigger via STC8051, not analog |
+| Stepper timing | **ROOT CAUSE FOUND** | Default 2µs pulse duration limits step rate to ~250mm/s |
+| Stepper timing fix | **TIERED APPROACH** | 100ns likely works but requires ESP32 firmware validation |
+| Move queue overflow | **ROOT CAUSE FOUND** | Same cause as stepper timing — excessive step rate |
+| H7 edge optimization | **SOLVED** | `stepper_event_full()` supports both-edges via `SF_SINGLE_SCHED` when pulse < 500ns |
+| ESP32 pulse width | **RESEARCHED** | Depends on firmware: ISR=2-5µs, PCNT=12.5ns, polling=120ns |
+| Load cell upgrade | **PATH DEFINED** | HX717 → RP2040 → upstream `load_cell_probe` — feasible, needs hardware mod |
+| Load cell false triggers | **SOLUTION IDENTIFIED** | HX717 + SOS filter eliminates root cause |
+| Upstream compatibility | **GAP** | Fork stuck on V0.11, needs port to current |
+
+## Recommended Actions
+
+### For Peopoly / Magneto X Users
+
+1. **Immediate**: Test `step_pulse_duration` starting at 1µs, working down to
+   100ns — validate with endstop repeatability checks
+2. **Short-term**: Set correct `step_pulse_duration` for X/Y linear motor axes,
+   re-enable "Stepper too far in past" safety check
+3. **Medium-term**: Upgrade load cell from CS1237/STC8051 to HX717 for proper
+   upstream `load_cell_probe` support
+4. **Long-term**: Port Magneto X config to upstream Klipper, eliminating all
+   fork workarounds
+
+### For Upstream Klipper
+
+1. **No code changes needed** — the step_pulse_duration mechanism already
+   supports non-TMC drivers via explicit config
+2. **Consider**: Adding a Magneto X example config to `config/` once pulse
+   width is validated
+3. **Consider**: Warning when step_pulse_duration limits achievable step rate
+   below configured max_velocity
